@@ -3,6 +3,46 @@
   include_role:
     name: common.validate_schema
 
+- name: Validate Samba workgroup name
+  assert:
+    that:
+      - samba_workgroup is string
+      - samba_workgroup | length > 0
+      - samba_workgroup | regex_search('^[A-Z0-9_]{1,15}$')
+      - samba_workgroup | upper == samba_workgroup
+      - samba_workgroup not in samba_reserved_workgroups
+    fail_msg: "samba_workgroup must be uppercase alphanumeric (max 15 chars) and not a reserved domain"
+
+- name: Validate Samba user definitions
+  assert:
+    that:
+      - item.name is defined
+      - item.password is defined
+      - item.uid is defined
+      - item.gid is defined
+      - item.password | length > 0
+    fail_msg: "Each Samba user requires name, password, uid, and gid"
+  loop: "{{ samba_users }}"
+  loop_control:
+    label: "{{ item.name | default('unnamed') }}"
+
+- name: Validate Samba share definitions
+  assert:
+    that:
+      - item.name is defined
+      - item.path is defined
+      - item.path | regex_search('^/')
+    fail_msg: "Each Samba share requires an absolute path"
+  loop: "{{ samba_shares }}"
+  loop_control:
+    label: "{{ item.name | default('unnamed') }}"
+
+- name: Ensure Samba share names are unique
+  assert:
+    that:
+      - (samba_shares | map(attribute='name') | list | unique | length) == (samba_shares | length)
+    fail_msg: "Duplicate share names detected in samba_shares"
+
 - name: Determine target runtimes
   vars:
     candidate_runtimes: "{{ runtime | default(target_runtimes | default(runtime_templates.keys() | list)) }}"
