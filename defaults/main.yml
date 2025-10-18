@@ -1,0 +1,203 @@
+service_id: samba
+service_name: samba
+service_unit_name: samba
+service_image: docker.io/crazymax/samba:4.21.4
+version: "4.21.4"
+needs_container_runtime: true
+service_ip: "{{ samba_container_ip }}"
+service_ports:
+  - target: 445
+    published: {{ samba_service_port_smb }}
+    protocol: tcp
+  - target: 139
+    published: {{ samba_service_port_netbios }}
+    protocol: tcp
+service_env:
+  - name: TZ
+    value: "{{ samba_timezone }}"
+  - name: SAMBA_WORKGROUP
+    value: "{{ samba_workgroup }}"
+  - name: SAMBA_SERVER_STRING
+    value: "{{ samba_server_string }}"
+  - name: SAMBA_LOG_LEVEL
+    value: "{{ samba_log_level }}"
+  - name: SAMBA_HOSTS_ALLOW
+    value: "{{ samba_hosts_allow }}"
+  - name: SAMBA_INTERFACES
+    value: "{{ samba_interfaces }}"
+  - name: WSDD2_ENABLE
+    value: "{{ samba_wsdd2_enable | ternary('1', '0') }}"
+  - name: WSDD2_HOSTNAME
+    value: "{{ samba_wsdd2_hostname }}"
+  - name: CONFIG_FILE
+    value: /run/secrets/samba-config
+service_volumes:
+  - name: config
+    source: "{{ samba_config_volume }}"
+    target: /data
+    driver: local
+    size: "{{ samba_config_volume_size_gb }}Gi"
+  - name: shares
+    source: "{{ samba_share_volume }}"
+    target: /shares
+    driver: local
+    size: "{{ samba_share_volume_size_gb }}Gi"
+service_packages:
+  - samba
+  - samba-common-bin
+service_services:
+  - name: smbd
+    enabled: true
+    state: started
+  - name: nmbd
+    enabled: true
+    state: started
+service_files:
+  - path: "{{ samba_baremetal_config_path }}"
+    mode: '0640'
+    content: "{{ samba_config_template | replace('/run/secrets/samba-admin-password', samba_baremetal_password_file) }}"
+  - path: "{{ samba_baremetal_password_file }}"
+    mode: '0600'
+    content: "{{ samba_admin_password }}"
+service_resources:
+  memory_mb: "{{ samba_container_memory_mb }}"
+  cpu_cores: "{{ samba_container_cpu_cores }}"
+service_namespace: "{{ samba_kubernetes_namespace }}"
+service_replicas: "{{ samba_kubernetes_replicas }}"
+service_container:
+  vmid: "{{ samba_container_vmid }}"
+  hostname: "{{ service_name }}"
+  ostemplate: "{{ samba_container_template }}"
+  disk: "{{ samba_container_storage_gb }}"
+  cores: "{{ samba_container_cpu_cores }}"
+  memory: "{{ samba_container_memory_mb }}"
+  swap: "{{ samba_container_swap_mb }}"
+  bridge: "{{ samba_container_bridge }}"
+  cidr: "{{ samba_container_cidr }}"
+  gateway: "{{ samba_container_gateway }}"
+  interface: "{{ samba_container_interface }}"
+  onboot: yes
+  unprivileged: yes
+  features: nesting=1,keyctl=1
+service_security:
+  run_as_user: 0
+  run_as_group: 0
+  read_only_root_filesystem: false
+  capabilities_drop: []
+  allow_privilege_escalation: false
+exports:
+  env:
+    - name: SAMBA_SERVER
+      value: "{{ service_ip }}"
+      description: IP address clients should target
+    - name: SAMBA_SHARE
+      value: "{{ samba_primary_share_name }}"
+      description: Default writable share name
+    - name: SAMBA_SHARE_URL
+      value: "{{ samba_primary_share_url }}"
+      description: UNC path for the primary share
+    - name: SAMBA_SHARE_PATH
+      value: "{{ samba_primary_share_path }}"
+      description: Container path where the share is stored
+mounts:
+  persistent_volumes:
+    - name: config
+      path: /data
+    - name: shares
+      path: /shares
+  ephemeral_mounts:
+    - name: samba-run
+      path: /run/samba
+      apply_to: [docker, podman, proxmox, baremetal]
+      medium: Memory
+      size: 32Mi
+      mode: '0755'
+health:
+  cmd:
+    - sh
+    - -c
+    - "smbstatus >/dev/null 2>&1"
+  interval: 30s
+  timeout: 10s
+  retries: 5
+storage:
+  - name: config
+    path: /data
+    size: "{{ samba_config_volume_size_gb }}G"
+  - name: shares
+    path: /shares
+    size: "{{ samba_share_volume_size_gb }}G"
+runtime_templates:
+  proxmox: proxmox.yml.j2
+  docker: docker.yml.j2
+  podman: podman.yml.j2
+  kubernetes: kubernetes.yml.j2
+  baremetal: baremetal.yml.j2
+secrets:
+  files:
+    - name: samba-config
+      target: samba-config
+      mode: '0600'
+      value: "{{ samba_config_template }}"
+    - name: samba-admin-password
+      target: samba-admin-password
+      mode: '0400'
+      value: "{{ samba_admin_password }}"
+
+samba_service_port_smb: 445
+samba_service_port_netbios: 139
+samba_config_volume: samba-config
+samba_share_volume: samba-share
+samba_config_volume_size_gb: 2
+samba_share_volume_size_gb: 200
+samba_container_vmid: 240
+samba_container_ip: 192.168.100.15
+samba_container_gateway: 192.168.100.1
+samba_container_cidr: 24
+samba_container_bridge: vmbr0
+samba_container_interface: eth0
+samba_container_cpu_cores: 2
+samba_container_memory_mb: 3072
+samba_container_swap_mb: 3072
+samba_container_storage_gb: "{{ samba_config_volume_size_gb + samba_share_volume_size_gb }}"
+samba_container_template: local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst
+samba_timezone: "{{ lookup('env', 'SAMBA_TZ') | default('UTC', true) }}"
+samba_workgroup: "{{ lookup('env', 'SAMBA_WORKGROUP') | default('WORKGROUP', true) }}"
+samba_server_string: "{{ lookup('env', 'SAMBA_SERVER_STRING') | default('Samba File Server', true) }}"
+samba_log_level: "{{ lookup('env', 'SAMBA_LOG_LEVEL') | default('1', true) }}"
+samba_hosts_allow: "{{ lookup('env', 'SAMBA_HOSTS_ALLOW') | default('127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16', true) }}"
+samba_interfaces: "{{ lookup('env', 'SAMBA_INTERFACES') | default('', true) }}"
+samba_wsdd2_enable: "{{ lookup('env', 'SAMBA_WSDD2_ENABLE') | default('0', true) | bool }}"
+samba_wsdd2_hostname: "{{ lookup('env', 'SAMBA_WSDD2_HOSTNAME') | default(service_name, true) }}"
+samba_admin_user: "{{ lookup('env', 'SAMBA_ADMIN_USER') | default('samba', true) }}"
+samba_admin_group: "{{ lookup('env', 'SAMBA_ADMIN_GROUP') | default('samba', true) }}"
+samba_admin_uid: "{{ lookup('env', 'SAMBA_ADMIN_UID') | default(10050, true) }}"
+samba_admin_gid: "{{ lookup('env', 'SAMBA_ADMIN_GID') | default(10050, true) }}"
+samba_admin_password: "{{ lookup('env', 'SAMBA_ADMIN_PASSWORD') | default('change-me-samba-admin', true) }}"
+samba_primary_share_name: "{{ lookup('env', 'SAMBA_PRIMARY_SHARE') | default('share', true) }}"
+samba_primary_share_path: "/shares/{{ samba_primary_share_name }}"
+samba_primary_share_url: "\\\\{{ service_ip }}\\{{ samba_primary_share_name }}"
+samba_kubernetes_namespace: files
+samba_kubernetes_replicas: 1
+samba_baremetal_config_path: "/etc/samba/{{ service_name }}/config.yml"
+samba_baremetal_password_file: "/etc/samba/{{ service_name }}/admin.pass"
+samba_config_template: |
+  auth:
+    - user: {{ samba_admin_user }}
+      group: {{ samba_admin_group }}
+      uid: {{ samba_admin_uid }}
+      gid: {{ samba_admin_gid }}
+      password_file: /run/secrets/samba-admin-password
+  global:
+    - "map to guest = Bad User"
+    - "server min protocol = SMB2"
+  share:
+    - name: {{ samba_primary_share_name }}
+      comment: Primary writable share
+      path: /shares/{{ samba_primary_share_name }}
+      browsable: yes
+      readonly: no
+      guestok: no
+      validusers: {{ samba_admin_user }}
+      writelist: {{ samba_admin_user }}
+      veto: no
