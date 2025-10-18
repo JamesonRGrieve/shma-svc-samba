@@ -47,3 +47,32 @@
         name: common.apply_runtime
       vars:
         runtime: "{{ runtime_item }}"
+
+- name: Ensure exports directory exists
+  vars:
+    exports_env_dir: "{{ service_exports_env_dir | default([playbook_dir | default('.'), 'exports'] | path_join) }}"
+  delegate_to: localhost
+  run_once: true
+  become: false
+  file:
+    path: "{{ exports_env_dir }}"
+    state: directory
+    mode: "0755"
+  when: "exports is defined and (exports.env | default([])) | length > 0"
+
+- name: Write exports environment file
+  vars:
+    exports_env_dir: "{{ service_exports_env_dir | default([playbook_dir | default('.'), 'exports'] | path_join) }}"
+    exports_env_file: "{{ service_exports_env_file | default([exports_env_dir, service_id ~ '.env'] | path_join) }}"
+    exports_env_entries: "{{ exports.env | default([]) }}"
+  delegate_to: localhost
+  run_once: true
+  become: false
+  copy:
+    dest: "{{ exports_env_file }}"
+    mode: "0640"
+    content: |-
+      {% for item in exports_env_entries %}
+      {{ item.name }}={{ item.value }}
+      {% endfor %}
+  when: "exports_env_entries | length > 0"

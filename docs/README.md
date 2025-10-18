@@ -17,6 +17,10 @@ SAMBA_SHARE_URL={{ samba_primary_share_url }}
 SAMBA_SHARE_PATH={{ samba_primary_share_path }}
 ```
 
+The role writes these values to `exports/{{ service_id }}.env` (override with
+`service_exports_env_file`) so downstream automation can source the canonical
+share coordinates during provisioning.
+
 ### Secrets
 - `samba-config` → rendered YAML config mounted via Docker/Podman secrets
 - `samba-admin-password` → stored separately and referenced from the config
@@ -27,6 +31,10 @@ SAMBA_SHARE_PATH={{ samba_primary_share_path }}
 
 ### Health Check
 Runs `smbstatus` inside the container / service to ensure `smbd` is online. The same probe feeds Compose healthchecks, Quadlet checks, Kubernetes readiness/liveness, and the post-deploy validation gate.
+
+### Edge Ingress
+SMB is not exposed over an HTTP edge; `edge_ingress` is intentionally not
+implemented for this service.
 
 ### Key Overrides
 | Variable | Default | Purpose |
