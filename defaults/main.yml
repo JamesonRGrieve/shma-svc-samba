@@ -12,6 +12,12 @@ service_ports:
   - target: 139
     published: {{ samba_service_port_netbios }}
     protocol: tcp
+  - target: 137
+    published: {{ samba_service_port_nmb }}
+    protocol: udp
+  - target: 138
+    published: {{ samba_service_port_dgram }}
+    protocol: udp
 service_env:
   - name: TZ
     value: "{{ samba_timezone }}"
@@ -25,6 +31,8 @@ service_env:
     value: "{{ samba_hosts_allow }}"
   - name: SAMBA_INTERFACES
     value: "{{ samba_interfaces }}"
+  - name: SAMBA_REALM
+    value: "{{ samba_ad_domain | default('', true) | upper }}"
   - name: WSDD2_ENABLE
     value: "{{ samba_wsdd2_enable | ternary('1', '0') }}"
   - name: WSDD2_HOSTNAME
@@ -42,6 +50,12 @@ service_volumes:
     target: /shares
     driver: local
     size: "{{ samba_share_volume_size_gb }}Gi"
+  - name: timezone
+    source: /etc/localtime
+    target: /etc/localtime
+    type: bind
+    read_only: true
+    apply_to: [docker, podman, baremetal]
 service_packages:
   - samba
   - samba-common-bin
@@ -55,10 +69,12 @@ service_services:
 service_files:
   - path: "{{ samba_baremetal_config_path }}"
     mode: '0640'
-    content: "{{ samba_config_template | replace('/run/secrets/samba-admin-password', samba_baremetal_password_file) }}"
-  - path: "{{ samba_baremetal_password_file }}"
+    content: "{{ samba_config_template | regex_replace('/run/secrets/', samba_baremetal_password_dir ~ '/') }}"
+  {% for user in samba_users %}
+  - path: "{{ [samba_baremetal_password_dir, samba_password_secret_prefix ~ user.name] | path_join }}"
     mode: '0600'
-    content: "{{ samba_admin_password }}"
+    content: "{{ user.password }}"
+  {% endfor %}
 service_resources:
   memory_mb: "{{ samba_container_memory_mb }}"
   cpu_cores: "{{ samba_container_cpu_cores }}"
@@ -78,27 +94,43 @@ service_container:
   interface: "{{ samba_container_interface }}"
   onboot: yes
   unprivileged: yes
-  features: nesting=1,keyctl=1
+  features: keyctl=1
 service_security:
-  run_as_user: 0
-  run_as_group: 0
-  read_only_root_filesystem: false
-  capabilities_drop: []
+  run_as_user: "{{ samba_service_uid }}"
+  run_as_group: "{{ samba_service_gid }}"
+  read_only_root_filesystem: true
+  capabilities_drop: ['ALL']
+  capabilities_add:
+    - CAP_NET_BIND_SERVICE
   allow_privilege_escalation: false
+  apparmor_profile: "{{ samba_apparmor_profile }}"
+  selinux_label: "{{ samba_selinux_context }}"
 exports:
   env:
     - name: SAMBA_SERVER
       value: "{{ service_ip }}"
       description: IP address clients should target
+    - name: SAMBA_PROTOCOL
+      value: "{{ samba_protocol_version }}"
+      description: Preferred SMB dialect for clients
     - name: SAMBA_SHARE
       value: "{{ samba_primary_share_name }}"
       description: Default writable share name
     - name: SAMBA_SHARE_URL
       value: "{{ samba_primary_share_url }}"
       description: UNC path for the primary share
+    - name: SAMBA_SHARE_SMB_URL
+      value: "{{ samba_primary_share_smb_url }}"
+      description: SMB URL format for GUI clients
     - name: SAMBA_SHARE_PATH
       value: "{{ samba_primary_share_path }}"
       description: Container path where the share is stored
+    - name: SAMBA_SHARE_MOUNT_PATH
+      value: "{{ samba_share_mount_path }}"
+      description: Host mount path for automation tooling
+    - name: SAMBA_EXTERNAL_HOSTNAME
+      value: "{{ samba_external_hostname }}"
+      description: DNS name clients should use when possible
 mounts:
   persistent_volumes:
     - name: config
@@ -112,11 +144,25 @@ mounts:
       medium: Memory
       size: 32Mi
       mode: '0755'
+    - name: samba-log
+      path: /var/log/samba
+      apply_to: [docker, podman, proxmox, baremetal]
+      medium: Memory
+      size: 64Mi
+      mode: '0755'
+    - name: samba-cache
+      path: /var/cache/samba
+      apply_to: [docker, podman, proxmox, baremetal]
+      medium: Memory
+      size: 64Mi
+      mode: '0755'
 health:
   cmd:
     - sh
     - -c
-    - "smbstatus >/dev/null 2>&1"
+    - >-
+      smbstatus >/dev/null 2>&1 &&
+      { [ "{{ samba_wsdd2_enable | ternary('1', '0') }}" = "0" ] || pgrep -f wsdd2 >/dev/null 2>&1; }
   interval: 30s
   timeout: 10s
   retries: 5
@@ -139,13 +185,17 @@ secrets:
       target: samba-config
       mode: '0600'
       value: "{{ samba_config_template }}"
-    - name: samba-admin-password
-      target: samba-admin-password
+  {% for user in samba_users %}
+    - name: "{{ samba_password_secret_prefix ~ user.name }}"
+      target: "{{ samba_password_secret_prefix ~ user.name }}"
       mode: '0400'
-      value: "{{ samba_admin_password }}"
+      value: "{{ user.password }}"
+  {% endfor %}
 
 samba_service_port_smb: 445
 samba_service_port_netbios: 139
+samba_service_port_nmb: 137
+samba_service_port_dgram: 138
 samba_config_volume: samba-config
 samba_share_volume: samba-share
 samba_config_volume_size_gb: 2
@@ -167,37 +217,196 @@ samba_server_string: "{{ lookup('env', 'SAMBA_SERVER_STRING') | default('Samba F
 samba_log_level: "{{ lookup('env', 'SAMBA_LOG_LEVEL') | default('1', true) }}"
 samba_hosts_allow: "{{ lookup('env', 'SAMBA_HOSTS_ALLOW') | default('127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16', true) }}"
 samba_interfaces: "{{ lookup('env', 'SAMBA_INTERFACES') | default('', true) }}"
+samba_bind_interfaces_only: true
 samba_wsdd2_enable: "{{ lookup('env', 'SAMBA_WSDD2_ENABLE') | default('0', true) | bool }}"
 samba_wsdd2_hostname: "{{ lookup('env', 'SAMBA_WSDD2_HOSTNAME') | default(service_name, true) }}"
-samba_admin_user: "{{ lookup('env', 'SAMBA_ADMIN_USER') | default('samba', true) }}"
-samba_admin_group: "{{ lookup('env', 'SAMBA_ADMIN_GROUP') | default('samba', true) }}"
-samba_admin_uid: "{{ lookup('env', 'SAMBA_ADMIN_UID') | default(10050, true) }}"
-samba_admin_gid: "{{ lookup('env', 'SAMBA_ADMIN_GID') | default(10050, true) }}"
-samba_admin_password: "{{ lookup('env', 'SAMBA_ADMIN_PASSWORD') | default('change-me-samba-admin', true) }}"
-samba_primary_share_name: "{{ lookup('env', 'SAMBA_PRIMARY_SHARE') | default('share', true) }}"
-samba_primary_share_path: "/shares/{{ samba_primary_share_name }}"
-samba_primary_share_url: "\\\\{{ service_ip }}\\{{ samba_primary_share_name }}"
+samba_ad_domain: "{{ lookup('env', 'SAMBA_AD_DOMAIN') | default('', true) }}"
+samba_ad_server: "{{ lookup('env', 'SAMBA_AD_SERVER') | default('', true) }}"
+samba_disable_ipv6: true
+samba_service_uid: "{{ lookup('env', 'SAMBA_SERVICE_UID') | default(1000, true) | int }}"
+samba_service_gid: "{{ lookup('env', 'SAMBA_SERVICE_GID') | default(1000, true) | int }}"
+samba_force_user: "{{ lookup('env', 'SAMBA_FORCE_USER') | default(lookup('env', 'SAMBA_ADMIN_USER') | default('samba', true), true) }}"
+samba_force_group: "{{ lookup('env', 'SAMBA_FORCE_GROUP') | default(lookup('env', 'SAMBA_ADMIN_GROUP') | default('samba', true), true) }}"
+samba_password_secret_prefix: "samba-password-"
+samba_protocol_version: SMB3
+samba_server_min_protocol: SMB2
+samba_server_max_protocol: SMB3
+samba_client_min_protocol: SMB2
+samba_client_max_protocol: SMB3
+samba_server_signing: mandatory
+samba_hosts_deny: "{{ lookup('env', 'SAMBA_HOSTS_DENY') | default('', true) }}"
+samba_reserved_workgroups:
+  - 'BUILTIN'
+  - 'NT AUTHORITY'
+  - 'NT SERVICE'
+samba_external_hostname: "{{ lookup('env', 'SAMBA_EXTERNAL_HOSTNAME') | default(service_name ~ '.local', true) }}"
+samba_share_mount_path: "{{ lookup('env', 'SAMBA_SHARE_MOUNT_PATH') | default('/srv/samba', true) }}"
+samba_recycle_bin_enabled: "{{ lookup('env', 'SAMBA_RECYCLE_ENABLE') | default('0', true) | bool }}"
+samba_recycle_bin_maxsize: "{{ lookup('env', 'SAMBA_RECYCLE_MAXSIZE') | default('0', true) }}"
+samba_recycle_bin_exclude: "{{ lookup('env', 'SAMBA_RECYCLE_EXCLUDE') | default('*.tmp *.temp', true) }}"
+samba_recycle_bin_expire: "{{ lookup('env', 'SAMBA_RECYCLE_EXPIRE') | default('14', true) }}"
+samba_quota_enabled: "{{ lookup('env', 'SAMBA_QUOTA_ENABLE') | default('0', true) | bool }}"
+samba_full_audit_enabled: "{{ lookup('env', 'SAMBA_FULL_AUDIT_ENABLE') | default('0', true) | bool }}"
+samba_full_audit_prefix: "{{ lookup('env', 'SAMBA_FULL_AUDIT_PREFIX') | default('%u|%I|%S', true) }}"
+samba_full_audit_success: "{{ lookup('env', 'SAMBA_FULL_AUDIT_SUCCESS') | default('open,write,rename', true) }}"
+samba_full_audit_failure: "{{ lookup('env', 'SAMBA_FULL_AUDIT_FAILURE') | default('connect,rename', true) }}"
+samba_shadow_copy_enabled: "{{ lookup('env', 'SAMBA_SHADOW_COPY_ENABLE') | default('0', true) | bool }}"
+samba_shadow_copy_snapdir: "{{ lookup('env', 'SAMBA_SHADOW_COPY_DIR') | default('.snapshots', true) }}"
+samba_apparmor_profile: "{{ lookup('env', 'SAMBA_APPARMOR_PROFILE') | default('localhost/svc-samba', true) }}"
+samba_selinux_context: "{{ lookup('env', 'SAMBA_SELINUX_CONTEXT') | default('system_u:system_r:samba_t:s0', true) }}"
+samba_users:
+  - name: "{{ lookup('env', 'SAMBA_ADMIN_USER') | default('samba', true) }}"
+    group: "{{ lookup('env', 'SAMBA_ADMIN_GROUP') | default('samba', true) }}"
+    uid: "{{ lookup('env', 'SAMBA_ADMIN_UID') | default(10050, true) }}"
+    gid: "{{ lookup('env', 'SAMBA_ADMIN_GID') | default(10050, true) }}"
+    password: "{{ lookup('env', 'SAMBA_ADMIN_PASSWORD') | default('change-me-samba-admin', true) }}"
+    password_file: "/run/secrets/{{ samba_password_secret_prefix }}{{ lookup('env', 'SAMBA_ADMIN_USER') | default('samba', true) }}"
+samba_shares:
+  - name: "{{ lookup('env', 'SAMBA_PRIMARY_SHARE') | default('share', true) }}"
+    comment: Primary writable share
+    path: "{{ lookup('env', 'SAMBA_PRIMARY_SHARE_PATH') | default('/shares/' ~ (lookup('env', 'SAMBA_PRIMARY_SHARE') | default('share', true)), true) }}"
+    browsable: true
+    read_only: false
+    guest_ok: false
+    valid_users: "{{ samba_users | map(attribute='name') | join(' ') }}"
+    write_list: "{{ samba_users | map(attribute='name') | join(' ') }}"
+    read_list: []
+    veto_files: []
+    force_user: "{{ samba_force_user }}"
+    force_group: "{{ samba_force_group }}"
+    recycle_bin: {{ samba_recycle_bin_enabled | bool }}
+samba_primary_share_name: "{{ (samba_shares | first).name }}"
+samba_primary_share_path: "{{ (samba_shares | first).path }}"
+samba_primary_share_url: "\\\\{{ samba_external_hostname or service_ip }}\\{{ samba_primary_share_name }}"
+samba_primary_share_smb_url: "smb://{{ samba_external_hostname or service_ip }}/{{ samba_primary_share_name }}"
 samba_kubernetes_namespace: files
 samba_kubernetes_replicas: 1
 samba_baremetal_config_path: "/etc/samba/{{ service_name }}/config.yml"
-samba_baremetal_password_file: "/etc/samba/{{ service_name }}/admin.pass"
+samba_baremetal_password_dir: "/etc/samba/{{ service_name }}/secrets"
 samba_config_template: |
   auth:
-    - user: {{ samba_admin_user }}
-      group: {{ samba_admin_group }}
-      uid: {{ samba_admin_uid }}
-      gid: {{ samba_admin_gid }}
-      password_file: /run/secrets/samba-admin-password
+  {% for user in samba_users %}
+    - user: {{ user.name }}
+      group: {{ user.group | default('') }}
+      uid: {{ user.uid }}
+      gid: {{ user.gid }}
+      password_file: {{ user.password_file | default('/run/secrets/' ~ samba_password_secret_prefix ~ user.name) }}
+  {% endfor %}
   global:
     - "map to guest = Bad User"
-    - "server min protocol = SMB2"
+    - "server string = {{ samba_server_string }}"
+    - "log level = {{ samba_log_level }}"
+    - "hosts allow = {{ samba_hosts_allow }}"
+{% if samba_hosts_deny %}
+    - "hosts deny = {{ samba_hosts_deny }}"
+{% endif %}
+    - "server min protocol = {{ samba_server_min_protocol }}"
+    - "server max protocol = {{ samba_server_max_protocol }}"
+    - "client min protocol = {{ samba_client_min_protocol }}"
+    - "client max protocol = {{ samba_client_max_protocol }}"
+    - "server signing = {{ samba_server_signing }}"
+    - "client signing = mandatory"
+    - "load printers = no"
+    - "printing = bsd"
+    - "printcap name = /dev/null"
+    - "disable spoolss = yes"
+    - "time server = yes"
+{% if samba_disable_ipv6 %}
+    - "smb ports = 445"
+{% endif %}
+{% if samba_bind_interfaces_only %}
+    - "bind interfaces only = yes"
+{% endif %}
+{% if samba_interfaces %}
+    - "interfaces = {{ samba_interfaces }}"
+{% else %}
+    - "interfaces = lo {{ service_ip }}"
+{% endif %}
+{% if samba_ad_domain %}
+    - "security = ADS"
+    - "realm = {{ samba_ad_domain | upper }}"
+{% if samba_ad_server %}
+    - "password server = {{ samba_ad_server }}"
+{% endif %}
+{% else %}
+    - "security = USER"
+{% endif %}
+{% set _global_vfs = [] %}
+{% if samba_quota_enabled %}{% set _ = _global_vfs.append('quota') %}{% endif %}
+{% if samba_full_audit_enabled %}{% set _ = _global_vfs.append('full_audit') %}{% endif %}
+{% if samba_shadow_copy_enabled %}{% set _ = _global_vfs.append('shadow_copy2') %}{% endif %}
+{% if _global_vfs %}
+    - "vfs objects = {{ _global_vfs | unique | join(' ') }}"
+{% endif %}
+{% if samba_full_audit_enabled %}
+    - "full_audit:prefix = {{ samba_full_audit_prefix }}"
+    - "full_audit:success = {{ samba_full_audit_success }}"
+    - "full_audit:failure = {{ samba_full_audit_failure }}"
+{% endif %}
+{% if samba_shadow_copy_enabled %}
+    - "shadow:format = auto-%Y%m%d-%H%M"
+    - "shadow:snapdir = {{ samba_shadow_copy_snapdir }}"
+    - "shadow:sort = desc"
+    - "shadow:snapprefix = {{ service_name }}-"
+    - "shadow:fixinodes = yes"
+    - "shadow:snapdirseverywhere = yes"
+{% endif %}
   share:
-    - name: {{ samba_primary_share_name }}
-      comment: Primary writable share
-      path: /shares/{{ samba_primary_share_name }}
-      browsable: yes
-      readonly: no
-      guestok: no
-      validusers: {{ samba_admin_user }}
-      writelist: {{ samba_admin_user }}
-      veto: no
+  {% for share in samba_shares %}
+  {%   set share_browsable = (share.browsable | default(share.browseable | default(True))) | bool %}
+  {%   set share_read_only = share.read_only | default(False) | bool %}
+  {%   set share_guest_ok = share.guest_ok | default(False) | bool %}
+  {%   set share_valid = share.valid_users if share.valid_users is defined else [] %}
+  {%   set share_read = share.read_list if share.read_list is defined else [] %}
+  {%   set share_write = share.write_list if share.write_list is defined else [] %}
+  {%   set share_veto = share.veto_files if share.veto_files is defined else [] %}
+  {%   set share_force_user = share.force_user | default(samba_force_user) %}
+  {%   set share_force_group = share.force_group | default(samba_force_group) %}
+  {%   set share_recycle = share.recycle_bin | default(False) | bool %}
+  {%   set _share_vfs = [] %}
+  {%   if share_recycle %}{% set _ = _share_vfs.append('recycle') %}{% endif %}
+  {%   if share.extra_vfs is defined %}{% for module in share.extra_vfs %}{% set _ = _share_vfs.append(module) %}{% endfor %}{% endif %}
+    - name: {{ share.name }}
+  {% if share.comment is defined %}
+      comment: {{ share.comment }}
+  {% endif %}
+      path: {{ share.path }}
+      browsable: {{ share_browsable | ternary('yes', 'no') }}
+      readonly: {{ share_read_only | ternary('yes', 'no') }}
+      guestok: {{ share_guest_ok | ternary('yes', 'no') }}
+  {% if share_valid %}
+      validusers: {{ share_valid | join(' ') if share_valid is iterable and share_valid is not string else share_valid }}
+  {% endif %}
+  {% if share_read %}
+      readlist: {{ share_read | join(' ') if share_read is iterable and share_read is not string else share_read }}
+  {% endif %}
+  {% if share_write %}
+      writelist: {{ share_write | join(' ') if share_write is iterable and share_write is not string else share_write }}
+  {% endif %}
+  {% if share_veto %}
+      veto: {{ share_veto | join(' ') if share_veto is iterable and share_veto is not string else share_veto }}
+  {% endif %}
+  {% if share_force_user %}
+      forceuser: {{ share_force_user }}
+  {% endif %}
+  {% if share_force_group %}
+      forcegroup: {{ share_force_group }}
+  {% endif %}
+  {% if _share_vfs %}
+      vfsobjects: {{ _share_vfs | unique | join(' ') }}
+  {% endif %}
+  {% if share_recycle %}
+      recycle_repository: .recycle
+      recycle_keeptree: yes
+      recycle_versions: yes
+      recycle_touch: yes
+      recycle_maxsize: {{ samba_recycle_bin_maxsize }}
+      recycle_exclude: {{ samba_recycle_bin_exclude }}
+      recycle_expire: {{ samba_recycle_bin_expire }}
+  {% endif %}
+  {% if share.extra_options is defined %}
+  {%   for opt_key, opt_val in share.extra_options.items() %}
+      {{ opt_key }}: {{ opt_val }}
+  {%   endfor %}
+  {% endif %}
+  {% endfor %}
